@@ -1,0 +1,209 @@
+esphome:
+  name: seven-seg-clock
+  friendly_name: seven-seg-clock
+  on_boot:
+    priority: 500  # Run after system components are initialized
+    then:
+      - light.turn_on:
+          id: clock_leds
+          effect: "Dynamic Time Display"
+
+# I tested this on both ESP8266 and ESP32 boards.  
+#   Uncomment the one you need and comment the other out.
+
+#esp8266:
+#  board: d1_mini
+
+esp32:
+  board: wemos_d1_mini32
+
+# Enable logging of type 'verbose'
+#  https://esphome.io/components/logger.html
+logger:
+  level: VERBOSE
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret seven-seg-clock-api
+
+ota:
+  - platform: esphome
+    password: !secret seven-seg-clock-ota
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: !secret seven-seg-clock-ip
+    gateway: !secret gateway
+    subnet: 255.255.255.0
+  reboot_timeout: 15min
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Seven-Seg-Clock"
+    password: !secret seven-seg-clock-ap
+
+captive_portal:
+
+# Use the Home Assistant 'sntp_time' platform to get the current time
+#  https://esphome.io/components/time/
+time:
+  - platform: homeassistant
+    id: sntp_time
+
+# Set up your LED strip, which should be 25 LEDs long (with the second-to-last LED always being
+#  off due it being blocked in the STL for the hour ten's column).
+#
+#  https://esphome.io/components/light/neopixelbus.html#neopixelbus-light
+light:
+  - platform: neopixelbus
+    type: GRB
+# Pin D4 is commonly used as the data pin on a WeMos D1 Mini ESP8266
+#    pin: D4
+# I chose pin IO16 (GPIO16 in ESPHome) as the LED data ping on my 
+#  WeMos D1 Mini ESP32 since it was close to VIN and GND.
+    pin: GPIO16
+    num_leds: 25
+    name: "Clock LEDs"
+    id: clock_leds
+    variant: WS2812X
+# Use the effects to drive the dynamic time display via C++ code in a lambda
+    effects:
+      - addressable_lambda:
+          name: "Dynamic Time Display"
+          update_interval: 1s
+          lambda: |-
+            auto now = id(sntp_time).now();
+            int hours, minutes;
+
+            if (id(enable_time_override).state) {
+              
+              // Use override values when time override switch is set
+              
+              hours = (int) id(override_hour).state;
+              minutes = (int) id(override_minute).state;
+              ESP_LOGD("Clock", "Override enabled: %02d:%02d", hours, minutes);
+            } else {
+              
+              // Use real time when the override switch is not set
+              
+              if (!now.is_valid()) return;
+              hours = now.hour % 12;
+              if (hours == 0) hours = 12;
+              minutes = now.minute;
+            }
+
+            /* 
+               The table below spells out which LEDs should light up so the
+                necessary segments illuminate for a given digit given the current time.  The
+                number after the "case" represents the desired digit, and the LED for each segment
+                will be illuminated for 'true' and dark for 'false'. 
+            */
+            
+            auto get_segments = [](int digit) -> std::vector<bool> {
+              switch (digit) {
+                case 0: return {true, true, true, false, true, true, true};         // 0
+                case 1: return {false, true, false, false, true, false, false};     // 1
+                case 2: return {true, true, false, true, false, true, true};        // 2
+                case 3: return {true, true, false, true, true, false, true};        // 3
+                case 4: return {false, true, true, true, true, false, false};       // 4
+                case 5: return {true, false, true, true, true, false, true};        // 5
+                case 6: return {true, false, true, true, true, true, true};         // 6
+                case 7: return {true, true, true, false, true, false, false};       // 7
+                case 8: return {true, true, true, true, true, true, true};          // 8
+                case 9: return {true, true, true, true, true, false, true};         // 9
+                default: return {false, false, false, false, false, false, false};  // Blank, all LEDs off
+              }
+            };
+
+            // Turn off all LEDs to clear the digits.
+
+            for (int i = 0; i < it.size(); i++) {
+              it[i] = Color(0, 0, 0);
+            }
+
+            // LED maps for each digit, where the LEDs in each segment are specified.
+            
+            const std::vector<int> minutes_ones_map = {0, 1, 2, 3, 4, 5, 6};
+            const std::vector<int> minutes_tens_map = {7, 8, 9, 10, 11, 12, 13};
+            const std::vector<int> hours_ones_map = {15, 16, 17, 18, 19, 20, 21};
+            const std::vector<int> hours_tens_map = {-1, 22, -1, -1, 24, -1, -1};  // LED 23 is not used
+
+            // Function to illuminate a given clock digit when called by the  
+            //  'set_digit' function calls later in this program.
+            
+            auto set_digit = [&](int start_idx, const std::vector<int> &led_map, int digit, int red, int green, int blue) {
+              if (start_idx == 22) {  // Hours ten's position
+                
+                // Output the hour ten's digit to the log when in time override mode.
+                
+                if (id(enable_time_override).state) {
+                  ESP_LOGD("Clock", "Hours ten's: %d", digit);
+                }
+
+                // Only illuminate then hour ten's LEDs for 10, 11, and 12 o'clock.
+                
+                if (digit != 1) return;  
+                
+              }
+
+              // Use the 'case' table above to identify which segments should be on or off.
+              
+              auto segments = get_segments(digit);
+              for (size_t i = 0; i < segments.size(); i++) {
+                if (segments[i] && led_map[i] != -1) {
+                  if (id(enable_time_override).state) {
+                    ESP_LOGD("Clock", "Illuminating LED: %d (Color: %d, %d, %d)", led_map[i], red, green, blue);
+                  }
+                  it[led_map[i]] = Color(red, green, blue);
+                }
+              }
+            };
+
+            // Call the 'set_digit' function above to illuminate the correct segments for each digit.
+            
+            set_digit(0, minutes_ones_map, minutes % 10, 0, 0, 255);    // Minutes one's (blue)
+            set_digit(7, minutes_tens_map, minutes / 10, 0, 255, 0);    // Minutes ten's (green)
+            set_digit(15, hours_ones_map, hours % 10, 255, 0, 0);       // Hours one's (red)
+            set_digit(22, hours_tens_map, hours / 10, 255, 255, 0);     // Hours ten's (yellow)
+
+            // Set the colon (LED 14 when counting from 0) to blink every second.
+            
+            if (now.second % 2 == 0) {
+              it[14] = Color(255, 255, 255);  // White colon
+            } else {
+              it[14] = Color(0, 0, 0);        // Off
+            }
+
+# Expose sliders to manually set the hours and minutes
+#  when overriding the time for testing/pranking/whatever.
+
+number:
+  - platform: template
+    name: "Override Hour"
+    id: override_hour
+    min_value: 0
+    max_value: 12
+    step: 1
+    initial_value: 12
+    optimistic: true
+  - platform: template
+    name: "Override Minute"
+    id: override_minute
+    min_value: 0
+    max_value: 59
+    step: 1
+    initial_value: 0
+    optimistic: true
+
+# Expose a switch to enable the overriding of the time
+#  to whatever you want for testing/pranking/whatever.
+
+switch:
+  - platform: template
+    name: "Enable Time Override"
+    id: enable_time_override
+    optimistic: true
+
